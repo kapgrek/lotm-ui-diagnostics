@@ -1,17 +1,17 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 
-[assembly: AssemblyTitle("Lord of the Mysteries UI & Font Diagnostics Tool")]
-[assembly: AssemblyDescription("Autonomous UI & Slate Font Engine Diagnostics Tool for Lord of the Mysteries (C7)")]
+[assembly: AssemblyTitle("Lord of the Mysteries UI Diagnostics Tool")]
+[assembly: AssemblyDescription("Autonomous UI and font diagnostics collector for Lord of the Mysteries (C7)")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("kapgrek")]
-[assembly: AssemblyProduct("LOTM UI Diagnostics")]
-[assembly: AssemblyCopyright("Copyright (C) 2026 kapgrek")]
+[assembly: AssemblyProduct("LOTM UI Diagnostics Tool")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
 [assembly: ComVisible(false)]
-[assembly: Guid("f4819a77-980b-4112-9c12-32b498f8e120")]
+[assembly: Guid("e5f83c84-18c7-4b77-8c36-39dfb39d10a2")]
 
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]

@@ -417,11 +417,14 @@ namespace LotmDiagnosticsTool
                 string luaDir = Path.Combine(modsDir, "lua", "mods", "cpdd_runtime_fixes");
                 if (!Directory.Exists(luaDir)) Directory.CreateDirectory(luaDir);
 
-                // 1. Install LotmDiagnostics.lua
+                // 1. Install LotmDiagnostics.lua in both mods/cpdd_runtime_fixes and Mods root
                 string modTarget = Path.Combine(luaDir, "LotmDiagnostics.lua");
                 byte[] modBytes = Convert.FromBase64String(EmbeddedModLuaBase64);
                 File.WriteAllBytes(modTarget, modBytes);
                 Log("[OK] Файл LotmDiagnostics.lua записан: " + modTarget);
+
+                string modTargetRoot = Path.Combine(modsDir, "LotmDiagnostics.lua");
+                try { File.WriteAllBytes(modTargetRoot, modBytes); } catch { }
 
                 // 2. Register in manifest.lua
                 string manifestPath = Path.Combine(modsDir, "manifest.lua");
@@ -456,11 +459,13 @@ namespace LotmDiagnosticsTool
                     }
                 }
 
-                // 3. Inject safe hook into Init.lua if exists
+                // 3. Inject safe hooks into Init.lua if exists
                 string initPath = Path.Combine(luaDir, "Init.lua");
                 if (File.Exists(initPath))
                 {
                     string initContent = File.ReadAllText(initPath, Encoding.UTF8);
+                    bool modified = false;
+
                     if (!initContent.Contains("LotmDiagnostics"))
                     {
                         string snippet = "\r\n    pcall(function()\r\n        local ok = pcall(require, \"mods.cpdd_runtime_fixes.LotmDiagnostics\")\r\n        if not ok then pcall(require, \"LotmDiagnostics\") end\r\n    end)\r\n";
@@ -468,9 +473,20 @@ namespace LotmDiagnosticsTool
                         {
                             int idx = initContent.LastIndexOf("return {");
                             initContent = initContent.Insert(idx, snippet);
-                            File.WriteAllText(initPath, initContent, Encoding.UTF8);
-                            Log("[OK] Безопасный вызов диагностики интегрирован в Init.lua.");
+                            modified = true;
                         }
+                    }
+
+                    if (initContent.Contains("repairComponent(component)") && !initContent.Contains("LotmDiagnostics.InspectPanel"))
+                    {
+                        initContent = initContent.Replace("repairComponent(component)", "repairComponent(component)\r\n    if _G.LotmDiagnostics and type(_G.LotmDiagnostics.InspectPanel) == \"function\" then pcall(_G.LotmDiagnostics.InspectPanel, _G.LotmDiagnostics, component, reason) end");
+                        modified = true;
+                    }
+
+                    if (modified)
+                    {
+                        File.WriteAllText(initPath, initContent, Encoding.UTF8);
+                        Log("[OK] Безопасная интеграция инспектора встроена в Init.lua.");
                     }
                 }
 
@@ -527,13 +543,35 @@ namespace LotmDiagnosticsTool
                     if (File.Exists(tempJson)) diagJson = tempJson;
                 }
 
+                string diagTxt = Path.Combine(logsDir, "lotm_diagnostics.txt");
+                if (!File.Exists(diagTxt))
+                {
+                    string tempTxt = Path.Combine(Path.GetTempPath(), "lotm_diagnostics.txt");
+                    if (File.Exists(tempTxt)) diagTxt = tempTxt;
+                }
+
+                string errLog = Path.Combine(logsDir, "lotm_diagnostics_error.log");
+                if (!File.Exists(errLog))
+                {
+                    string tempErr = Path.Combine(Path.GetTempPath(), "lotm_diagnostics_error.log");
+                    if (File.Exists(tempErr)) errLog = tempErr;
+                }
+
+                if (File.Exists(errLog))
+                {
+                    Log("[!] Обнаружен журнал ошибок мода: " + errLog);
+                    sb.AppendLine("--- ⚠️ ЖУРНАЛ ОШИБОК ДИАГНОСТИКИ ---");
+                    sb.AppendLine(File.ReadAllText(errLog, Encoding.UTF8));
+                    sb.AppendLine();
+                }
+
                 int panelsCount = 0;
                 int widgetsCount = 0;
                 List<string> activePanels = new List<string>();
 
                 if (File.Exists(diagJson))
                 {
-                    Log("[OK] Обнаружен файл диагностики: " + diagJson);
+                    Log("[OK] Обнаружен JSON файл диагностики: " + diagJson);
                     string json = File.ReadAllText(diagJson, Encoding.UTF8);
 
                     var panelMatches = Regex.Matches(json, "\"uid\":\\s*\"([^\"]+)\"");
@@ -556,10 +594,17 @@ namespace LotmDiagnosticsTool
                 }
                 else
                 {
-                    Log("[!] Файл lotm_diagnostics.json пока не найден в Saved\\Logs.");
-                    Log("    Убедитесь, что вы запустили игру и открыли Магазин или Квесты.");
-                    sb.AppendLine("--- 1. ДИАГНОСТИКА МОДА ---");
+                    Log("[!] Файл lotm_diagnostics.json пока не найден в Saved\\Logs или %TEMP%.");
+                    sb.AppendLine("--- 1. ДИАГНОСТИКА МОДА (JSON) ---");
                     sb.AppendLine("lotm_diagnostics.json не найден.");
+                    sb.AppendLine();
+                }
+
+                if (File.Exists(diagTxt))
+                {
+                    Log("[OK] Обнаружен текстовый отчет диагностики: " + diagTxt);
+                    sb.AppendLine("--- 1.1 ТЕКСТОВАЯ СВОДКА ВИДЖЕТОВ ---");
+                    sb.AppendLine(File.ReadAllText(diagTxt, Encoding.UTF8));
                     sb.AppendLine();
                 }
 

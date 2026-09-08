@@ -5,7 +5,7 @@
 --          to pinpoint font stretching, LetterSpacing, and asset resolution.
 -- ============================================================================
 
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 local MODULE_TAG = "[LotmDiagnostics]"
 
 -- ----------------------------------------------------------------------------
@@ -33,26 +33,46 @@ local function report(message)
     end
 end
 
-local function getSavedLogsDir()
-    local savedDir = nil
-    if PathsLib ~= nil and type(PathsLib.ProjectSavedDir) == "function" then
-        local ok, res = pcall(PathsLib.ProjectSavedDir)
-        if ok and res ~= nil and res ~= "" then
-            savedDir = tostring(res)
+local function reportError(context, err)
+    local line = MODULE_TAG .. " [ERROR] in " .. tostring(context) .. ": " .. tostring(err)
+    local logger = rawget(_G, "Log") or rawget(_G, "LaunchLog") or rawget(_G, "LuaCLogger")
+    if logger ~= nil then
+        if type(logger.Error) == "function" then
+            pcall(logger.Error, line)
+        elseif type(logger.Info) == "function" then
+            pcall(logger.Info, line)
         end
     end
-    if savedDir == nil and FileLib ~= nil and type(FileLib.GetFilePath) == "function" and PathsLib ~= nil then
-        local ok, res = pcall(function()
-            return FileLib.GetFilePath(PathsLib.ProjectSavedDir())
-        end)
-        if ok and res ~= nil and res ~= "" then
-            savedDir = tostring(res)
+    pcall(function()
+        local tempDir = os.getenv("TEMP") or "."
+        local f = io.open(tempDir .. "/lotm_diagnostics_error.log", "a")
+        if f then
+            f:write(string.format("[%s] [%s] %s\n", os.date("%Y-%m-%d %H:%M:%S"), tostring(context), tostring(err)))
+            f:close()
         end
+    end)
+end
+
+local function getSavedLogsDir()
+    local savedDir = nil
+    pcall(function()
+        if FileLib ~= nil and PathsLib ~= nil and type(PathsLib.ProjectSavedDir) == "function" then
+            local p = PathsLib.ProjectSavedDir()
+            if p ~= nil and type(FileLib.GetFilePath) == "function" then
+                savedDir = tostring(FileLib.GetFilePath(p))
+            end
+        end
+    end)
+    if savedDir == nil or savedDir == "" then
+        pcall(function()
+            if PathsLib ~= nil and type(PathsLib.ProjectSavedDir) == "function" then
+                savedDir = tostring(PathsLib.ProjectSavedDir())
+            end
+        end)
     end
     if savedDir == nil or savedDir == "" then
         savedDir = "Saved"
     end
-    -- Normalize path separators to forward slash
     savedDir = savedDir:gsub("\\", "/")
     if savedDir:sub(-1) == "/" then
         savedDir = savedDir:sub(1, -2)
@@ -62,43 +82,19 @@ end
 
 local function saveOutputFile(filePath, content)
     local written = false
-
-    -- Attempt 1: FileLib.SaveFile(path, content)
-    if FileLib ~= nil and type(FileLib.SaveFile) == "function" then
-        local ok = pcall(FileLib.SaveFile, filePath, content)
-        if ok then written = true end
-        if not written then
-            -- Some bindings swap arguments: (content, path)
-            local ok2 = pcall(FileLib.SaveFile, content, filePath)
-            if ok2 then written = true end
-        end
-    end
-
-    -- Attempt 2: FileLib.SaveStringContentToFile(content, path)
-    if not written and FileLib ~= nil and type(FileLib.SaveStringContentToFile) == "function" then
-        local ok = pcall(FileLib.SaveStringContentToFile, content, filePath)
-        if ok then written = true end
-        if not written then
-            local ok2 = pcall(FileLib.SaveStringContentToFile, filePath, content)
-            if ok2 then written = true end
-        end
-    end
-
-    -- Attempt 3: Native Lua io.open
-    if not written then
-        local ok, f = pcall(io.open, filePath, "wb")
-        if ok and f ~= nil then
+    pcall(function()
+        local f = io.open(filePath, "wb")
+        if f ~= nil then
             f:write(content)
             f:close()
             written = true
         end
-    end
-
+    end)
     return written
 end
 
 -- ----------------------------------------------------------------------------
--- 2. Pure-Lua Zero-Dependency JSON Serializer
+-- 2. Pure-Lua Zero-Dependency JSON Serializer (Crash-Proof)
 -- ----------------------------------------------------------------------------
 local function escape_json_string(s)
     if type(s) ~= "string" then s = tostring(s or "") end
@@ -131,7 +127,11 @@ local function is_table_array(t)
     return true
 end
 
-local function to_json_indented(val, current_indent)
+local function to_json_indented(val, current_indent, visited, depth)
+    visited = visited or {}
+    depth = depth or 0
+    if depth > 25 then return "\"<max_depth>\"" end
+
     current_indent = current_indent or ""
     local sub_indent = current_indent .. "  "
     local t = type(val)
@@ -141,29 +141,43 @@ local function to_json_indented(val, current_indent)
     elseif t == "boolean" then
         return val and "true" or "false"
     elseif t == "number" then
-        if val ~= val then return "null" end -- NaN
+        if val ~= val then return "null" end
         if val == math.huge or val == -math.huge then return "null" end
         return tostring(val)
     elseif t == "string" then
         return "\"" .. escape_json_string(val) .. "\""
     elseif t == "table" then
+        if visited[val] then return "\"<cyclic_ref>\"" end
+        visited[val] = true
+
         if is_table_array(val) then
-            if #val == 0 then return "[]" end
+            if #val == 0 then
+                visited[val] = nil
+                return "[]"
+            end
             local parts = {}
             for i = 1, #val do
-                parts[#parts + 1] = sub_indent .. to_json_indented(val[i], sub_indent)
+                parts[#parts + 1] = sub_indent .. to_json_indented(val[i], sub_indent, visited, depth + 1)
             end
+            visited[val] = nil
             return "[\n" .. table.concat(parts, ",\n") .. "\n" .. current_indent .. "]"
         else
             local keys = {}
-            for k, _ in pairs(val) do keys[#keys + 1] = tostring(k) end
-            table.sort(keys)
-            if #keys == 0 then return "{}" end
+            for k, _ in pairs(val) do
+                keys[#keys + 1] = k
+            end
+            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            if #keys == 0 then
+                visited[val] = nil
+                return "{}"
+            end
             local parts = {}
             for _, k in ipairs(keys) do
-                local v = val[k] or val[tonumber(k)]
-                parts[#parts + 1] = sub_indent .. "\"" .. escape_json_string(k) .. "\": " .. to_json_indented(v, sub_indent)
+                local v = val[k]
+                local keyStr = tostring(k)
+                parts[#parts + 1] = sub_indent .. "\"" .. escape_json_string(keyStr) .. "\": " .. to_json_indented(v, sub_indent, visited, depth + 1)
             end
+            visited[val] = nil
             return "{\n" .. table.concat(parts, ",\n") .. "\n" .. current_indent .. "}"
         end
     else
@@ -179,14 +193,16 @@ local Diagnostics = {
     StartTime = os.date("%Y-%m-%d %H:%M:%S"),
     LastDumpTime = nil,
     DumpCount = 0,
-    ActivePanels = {},       -- [panel_uid] = panel_data
-    RecentEvents = {},       -- list of recent UIComponent Open/Refresh events
+    ActivePanels = {},
+    RecentEvents = {},
     CapturedWidgetsCount = 0,
     IsDirty = false,
 }
 
 local function format_timestamp()
-    return os.date("%Y-%m-%d %H:%M:%S")
+    local ts = "unknown"
+    pcall(function() ts = os.date("%Y-%m-%d %H:%M:%S") end)
+    return ts
 end
 
 -- ----------------------------------------------------------------------------
@@ -216,50 +232,60 @@ local function scanLoadedModules()
         global_game_systems = {},
     }
 
-    if type(package) == "table" and type(package.loaded) == "table" then
-        for k, v in pairs(package.loaded) do
-            result.total_package_loaded = result.total_package_loaded + 1
-            local name = tostring(k)
-            if matches_keywords(name) then
-                result.matched_package_modules[#result.matched_package_modules + 1] = name
-                local lower = name:lower()
-                if lower:find("shop", 1, true) then
-                    result.identified_shop_classes[#result.identified_shop_classes + 1] = name
-                end
-                if lower:find("task", 1, true) or lower:find("quest", 1, true) or lower:find("board", 1, true) then
-                    result.identified_task_classes[#result.identified_task_classes + 1] = name
-                end
-            end
-        end
-    end
-    table.sort(result.matched_package_modules)
-    table.sort(result.identified_shop_classes)
-    table.sort(result.identified_task_classes)
-
-    local GameObj = rawget(_G, "Game")
-    if type(GameObj) == "table" then
-        if type(GameObj.loaded) == "table" then
-            for k, _ in pairs(GameObj.loaded) do
-                result.total_game_loaded = result.total_game_loaded + 1
+    pcall(function()
+        if type(package) == "table" and type(package.loaded) == "table" then
+            for k, _ in pairs(package.loaded) do
+                result.total_package_loaded = result.total_package_loaded + 1
                 local name = tostring(k)
                 if matches_keywords(name) then
-                    result.matched_game_modules[#result.matched_game_modules + 1] = name
+                    result.matched_package_modules[#result.matched_package_modules + 1] = name
+                    local lower = name:lower()
+                    if lower:find("shop", 1, true) then
+                        result.identified_shop_classes[#result.identified_shop_classes + 1] = name
+                    end
+                    if lower:find("task", 1, true) or lower:find("quest", 1, true) or lower:find("board", 1, true) then
+                        result.identified_task_classes[#result.identified_task_classes + 1] = name
+                    end
                 end
             end
-            table.sort(result.matched_game_modules)
+            table.sort(result.matched_package_modules)
+            table.sort(result.identified_shop_classes)
+            table.sort(result.identified_task_classes)
         end
+    end)
 
-        for k, v in pairs(GameObj) do
-            local keyStr = tostring(k)
-            if matches_keywords(keyStr) then
-                result.global_game_systems[#result.global_game_systems + 1] = {
-                    name = keyStr,
-                    type = type(v),
-                    class = (type(v) == "table" and (v.__cname or (v.Class and tostring(v.Class)))) or nil
-                }
+    pcall(function()
+        local GameObj = rawget(_G, "Game")
+        if type(GameObj) == "table" then
+            if type(GameObj.loaded) == "table" then
+                for k, _ in pairs(GameObj.loaded) do
+                    result.total_game_loaded = result.total_game_loaded + 1
+                    local name = tostring(k)
+                    if matches_keywords(name) then
+                        result.matched_game_modules[#result.matched_game_modules + 1] = name
+                    end
+                end
+                table.sort(result.matched_game_modules)
+            end
+
+            for k, v in pairs(GameObj) do
+                local keyStr = tostring(k)
+                if matches_keywords(keyStr) then
+                    local clsName = nil
+                    pcall(function()
+                        if type(v) == "table" then
+                            clsName = rawget(v, "__cname") or (rawget(v, "Class") and tostring(rawget(v, "Class")))
+                        end
+                    end)
+                    result.global_game_systems[#result.global_game_systems + 1] = {
+                        name = keyStr,
+                        type = type(v),
+                        class = clsName
+                    }
+                end
             end
         end
-    end
+    end)
 
     return result
 end
@@ -271,21 +297,31 @@ local function getWidgetText(widget)
     if widget == nil then return "" end
     local text = ""
     pcall(function()
-        if type(widget.GetText) == "function" then
-            local t = widget:GetText()
-            text = (type(t) == "string" and t) or (t ~= nil and tostring(t)) or ""
-        elseif widget.Text ~= nil then
-            local t = widget.Text
-            text = (type(t) == "string" and t) or (t ~= nil and tostring(t)) or ""
-        elseif type(widget.GetPlainText) == "function" then
-            local t = widget:GetPlainText()
-            text = (type(t) == "string" and t) or (t ~= nil and tostring(t)) or ""
-        elseif widget.Content ~= nil then
-            local t = widget.Content
-            text = (type(t) == "string" and t) or (t ~= nil and tostring(t)) or ""
-        elseif type(widget.GetContent) == "function" then
-            local t = widget:GetContent()
-            text = (type(t) == "string" and t) or (t ~= nil and tostring(t)) or ""
+        local getText = nil
+        pcall(function() getText = widget.GetText end)
+        if type(getText) == "function" then
+            local ok, t = pcall(getText, widget)
+            if ok and t ~= nil then text = tostring(t) end
+        end
+        if text == "" then
+            local t = nil
+            pcall(function() t = widget.Text end)
+            if t ~= nil then text = tostring(t) end
+        end
+        if text == "" then
+            local getPT = nil
+            pcall(function() getPT = widget.GetPlainText end)
+            if type(getPT) == "function" then
+                local ok, t = pcall(getPT, widget)
+                if ok and t ~= nil then text = tostring(t) end
+            end
+        end
+        if text == "" then
+            local cnt = nil
+            pcall(function() cnt = widget.Content end)
+            if cnt ~= nil and type(cnt) ~= "table" and type(cnt) ~= "userdata" then
+                text = tostring(cnt)
+            end
         end
     end)
     return text
@@ -296,7 +332,7 @@ local function getWidgetHierarchyPath(widget)
     local chain = {}
     local curr = widget
     local depth = 0
-    while curr ~= nil and depth < 30 do
+    while curr ~= nil and depth < 25 do
         depth = depth + 1
         local name = nil
         pcall(function()
@@ -305,19 +341,27 @@ local function getWidgetHierarchyPath(widget)
             end
         end)
         if name == nil or name == "" then
-            name = (type(curr) == "table" and (curr.__cname or curr.uid or curr.UID)) or tostring(curr)
+            pcall(function()
+                if type(curr) == "table" then
+                    name = curr.__cname or curr.uid or curr.UID
+                end
+            end)
         end
-        chain[#chain + 1] = name
+        if name == nil or name == "" then
+            name = tostring(curr)
+        end
+        chain[#chain + 1] = tostring(name)
+
         local parent = nil
         pcall(function()
             if type(curr.GetParent) == "function" then
                 parent = curr:GetParent()
             end
         end)
+        if parent == curr then break end
         curr = parent
     end
 
-    -- Reverse chain to get Root -> Child path
     local reversed = {}
     for i = #chain, 1, -1 do
         reversed[#reversed + 1] = chain[i]
@@ -335,7 +379,12 @@ local function inspectWidgetDetails(widget)
         end
     end)
     if wName == "" then
-        wName = (type(widget) == "table" and (widget.__cname or widget.uid or widget.UID)) or tostring(widget)
+        pcall(function()
+            if type(widget) == "table" then
+                wName = tostring(widget.__cname or widget.uid or widget.UID or "")
+            end
+        end)
+        if wName == "" then wName = tostring(widget) end
     end
 
     local rawText = getWidgetText(widget)
@@ -349,10 +398,11 @@ local function inspectWidgetDetails(widget)
     pcall(function()
         if type(widget.GetFont) == "function" then
             font = widget:GetFont()
-        elseif widget.Font ~= nil then
-            font = widget.Font
         end
     end)
+    if font == nil then
+        pcall(function() font = widget.Font end)
+    end
 
     local styleFont = nil
     pcall(function()
@@ -397,7 +447,7 @@ local function inspectWidgetDetails(widget)
         end)
     end
 
-    -- UMG Widget-level letter spacing (if present on custom C7/KG text widget)
+    -- UMG Widget-level letter spacing
     local widgetLetterSpacing = nil
     pcall(function()
         if widget.LetterSpacing ~= nil then
@@ -430,7 +480,6 @@ local function inspectWidgetDetails(widget)
 
     local hasCyrillic = rawText:find("[\208\209]") ~= nil
 
-    -- Determine widget type class
     local widgetClass = (type(widget) == "table" and widget.__cname) or "Widget"
     pcall(function()
         if type(widget.GetClass) == "function" then
@@ -462,7 +511,7 @@ local function walkAllWidgets(owner, visited, collector)
     if owner == nil or visited[owner] then return end
     visited[owner] = true
 
-    collector(owner)
+    pcall(collector, owner)
 
     -- Children via UPanelWidget
     local count = nil
@@ -506,17 +555,16 @@ local function walkAllWidgets(owner, visited, collector)
         end
     end
 
-    -- Unreal WidgetTree lookups
-    local tree = nil
-    pcall(function() tree = owner.WidgetTree end)
-    if tree ~= nil and type(tree.GetAllWidgets) == "function" then
-        local widgets = {}
-        local ok, res = pcall(tree.GetAllWidgets, tree, widgets)
-        local allWidgets = (ok and type(res) == "table" and res) or widgets
-        for _, w in pairs(allWidgets) do
-            walkAllWidgets(w, visited, collector)
+    -- Child widgets via view table
+    pcall(function()
+        if type(owner.view) == "table" then
+            for _, vw in pairs(owner.view) do
+                if vw ~= nil and type(vw) ~= "function" then
+                    walkAllWidgets(vw, visited, collector)
+                end
+            end
         end
-    end
+    end)
 end
 
 -- ----------------------------------------------------------------------------
@@ -525,26 +573,50 @@ end
 local function inspectPanel(component, triggerReason)
     if component == nil then return end
 
-    local uid = tostring(component.uid or component.UID or component.__cname or "UnknownPanel")
-    local rootWidget = component.userWidget or component.widget
-    local view = component.view
+    local uid = "UnknownPanel"
+    pcall(function()
+        uid = tostring(component.uid or component.UID or component.__cname or "UnknownPanel")
+    end)
+
+    local rootWidget = nil
+    pcall(function()
+        rootWidget = component.userWidget or component.widget or (type(component) ~= "table" and component)
+    end)
+    local view = nil
+    pcall(function() view = component.view end)
 
     local panelWidgets = {}
     local visited = setmetatable({}, { __mode = "k" })
 
     local function checkAndCollect(w)
         if w == nil then return end
-        -- Check if it is a text-bearing widget
         local isText = false
         pcall(function()
-            if type(w.GetText) == "function" or w.Text ~= nil or type(w.GetPlainText) == "function"
-                or type(w.GetFont) == "function" or w.Font ~= nil
-                or (w.DefaultTextStyleOverride ~= nil and w.DefaultTextStyleOverride.Font ~= nil) then
-                isText = true
-            end
+            local getText = nil
+            pcall(function() getText = w.GetText end)
+            if type(getText) == "function" then isText = true end
         end)
+        if not isText then
+            pcall(function()
+                if w.Text ~= nil then isText = true end
+            end)
+        end
+        if not isText then
+            pcall(function()
+                local getFont = nil
+                pcall(function() getFont = w.GetFont end)
+                if type(getFont) == "function" or w.Font ~= nil then isText = true end
+            end)
+        end
+        if not isText then
+            pcall(function()
+                if w.DefaultTextStyleOverride ~= nil then isText = true end
+            end)
+        end
+
         if isText then
-            local details = inspectWidgetDetails(w)
+            local details = nil
+            pcall(function() details = inspectWidgetDetails(w) end)
             if details ~= nil then
                 panelWidgets[#panelWidgets + 1] = details
             end
@@ -563,19 +635,24 @@ local function inspectPanel(component, triggerReason)
         end
     end
 
-    -- Walk any child UIComponents
-    if type(component._childComponents) == "table" then
-        for _, child in pairs(component._childComponents) do
-            local childRoot = child and (child.userWidget or child.widget)
-            if childRoot ~= nil then
-                walkAllWidgets(childRoot, visited, checkAndCollect)
+    -- Walk child components
+    pcall(function()
+        if type(component._childComponents) == "table" then
+            for _, child in pairs(component._childComponents) do
+                local childRoot = child and (child.userWidget or child.widget)
+                if childRoot ~= nil then
+                    walkAllWidgets(childRoot, visited, checkAndCollect)
+                end
             end
         end
-    end
+    end)
+
+    local className = uid
+    pcall(function() className = tostring(component.__cname or uid) end)
 
     Diagnostics.ActivePanels[uid] = {
         uid = uid,
-        class_name = tostring(component.__cname or uid),
+        class_name = className,
         last_event = triggerReason or "Manual",
         last_updated = format_timestamp(),
         text_widgets_count = #panelWidgets,
@@ -621,35 +698,43 @@ local function generateTxtSummary(reportData)
 
     add("--- 2. ИДЕНТИФИЦИРОВАННЫЕ КЛАССЫ МАГАЗИНОВ И КВЕСТОВ ---")
     add("Классы Магазинов:")
-    for _, c in ipairs(reportData.environment.modules.identified_shop_classes) do
-        add("  - " .. c)
+    if type(reportData.environment.modules.identified_shop_classes) == "table" then
+        for _, c in ipairs(reportData.environment.modules.identified_shop_classes) do
+            add("  - " .. c)
+        end
     end
     add("Классы Заданий и Доски:")
-    for _, c in ipairs(reportData.environment.modules.identified_task_classes) do
-        add("  - " .. c)
+    if type(reportData.environment.modules.identified_task_classes) == "table" then
+        for _, c in ipairs(reportData.environment.modules.identified_task_classes) do
+            add("  - " .. c)
+        end
     end
     add("")
 
     add("--- 3. АКТИВНЫЕ ПАНЕЛИ И ВИДЖЕТЫ (Всего виджетов: " .. tostring(reportData.summary.total_captured_widgets) .. ") ---")
-    for _, panel in ipairs(reportData.active_panels) do
-        add("--------------------------------------------------------------------------------")
-        add("ПАНЕЛЬ: " .. tostring(panel.uid) .. " (Виджетов: " .. tostring(panel.text_widgets_count) .. ", Событие: " .. tostring(panel.last_event) .. ")")
-        add("--------------------------------------------------------------------------------")
-        for idx, w in ipairs(panel.widgets) do
-            local f = w.font or {}
-            add(string.format("[%02d] %-32s | Font: %-4s | Spacing(Slate): %-5s | Spacing(Widget): %-4s | Desired: (%d,%d)",
-                idx,
-                w.name:sub(1, 32),
-                tostring(f.font_size or "-"),
-                tostring(f.letter_spacing_slate or "-"),
-                tostring(w.widget_letter_spacing or "-"),
-                f.desired_size and f.desired_size.x or (w.desired_size and w.desired_size.x or 0),
-                f.desired_size and f.desired_size.y or (w.desired_size and w.desired_size.y or 0)
-            ))
-            add("     Иерархия: " .. tostring(w.hierarchy_path))
-            add("     Ассет шрифта: " .. tostring(f.font_object_path) .. " [" .. tostring(f.typeface_name) .. "]")
-            add("     Текст: \"" .. tostring(w.text_sample) .. "\" (Длина: " .. tostring(w.text_length) .. ", Кириллица: " .. tostring(w.has_cyrillic) .. ")")
-            add("")
+    if type(reportData.active_panels) == "table" then
+        for _, panel in ipairs(reportData.active_panels) do
+            add("--------------------------------------------------------------------------------")
+            add("ПАНЕЛЬ: " .. tostring(panel.uid) .. " (Виджетов: " .. tostring(panel.text_widgets_count) .. ", Событие: " .. tostring(panel.last_event) .. ")")
+            add("--------------------------------------------------------------------------------")
+            if type(panel.widgets) == "table" then
+                for idx, w in ipairs(panel.widgets) do
+                    local f = w.font or {}
+                    add(string.format("[%02d] %-32s | Font: %-4s | Spacing(Slate): %-5s | Spacing(Widget): %-4s | Desired: (%d,%d)",
+                        idx,
+                        tostring(w.name):sub(1, 32),
+                        tostring(f.font_size or "-"),
+                        tostring(f.letter_spacing_slate or "-"),
+                        tostring(w.widget_letter_spacing or "-"),
+                        f.desired_size and f.desired_size.x or (w.desired_size and w.desired_size.x or 0),
+                        f.desired_size and f.desired_size.y or (w.desired_size and w.desired_size.y or 0)
+                    ))
+                    add("     Иерархия: " .. tostring(w.hierarchy_path))
+                    add("     Ассет шрифта: " .. tostring(f.font_object_path) .. " [" .. tostring(f.typeface_name) .. "]")
+                    add("     Текст: \"" .. tostring(w.text_sample) .. "\" (Длина: " .. tostring(w.text_length) .. ", Кириллица: " .. tostring(w.has_cyrillic) .. ")")
+                    add("")
+                end
+            end
         end
     end
 
@@ -660,56 +745,73 @@ local function generateTxtSummary(reportData)
 end
 
 function Diagnostics:Flush()
-    if not self.IsDirty and self.DumpCount > 0 then return end
-    self.IsDirty = false
-    self.DumpCount = self.DumpCount + 1
-    self.LastDumpTime = format_timestamp()
+    local ok, err = pcall(function()
+        self.IsDirty = false
+        self.DumpCount = self.DumpCount + 1
+        self.LastDumpTime = format_timestamp()
 
-    local logsDir = getSavedLogsDir()
-    local jsonPath = logsDir .. "/lotm_diagnostics.json"
-    local txtPath = logsDir .. "/lotm_diagnostics.txt"
+        local logsDir = getSavedLogsDir()
+        local jsonPath = logsDir .. "/lotm_diagnostics.json"
+        local txtPath = logsDir .. "/lotm_diagnostics.txt"
 
-    local reportData = {
-        diagnostics_version = self.Version,
-        timestamp = self.LastDumpTime,
-        dump_count = self.DumpCount,
-        environment = {
-            saved_logs_dir = logsDir,
-            modules = scanLoadedModules(),
-        },
-        summary = {
-            total_active_panels = 0,
-            total_captured_widgets = self.CapturedWidgetsCount,
-        },
-        active_panels = {},
-        recent_events = self.RecentEvents,
-    }
+        local reportData = {
+            diagnostics_version = self.Version,
+            timestamp = self.LastDumpTime,
+            dump_count = self.DumpCount,
+            environment = {
+                saved_logs_dir = logsDir,
+                modules = scanLoadedModules(),
+            },
+            summary = {
+                total_active_panels = 0,
+                total_captured_widgets = self.CapturedWidgetsCount,
+            },
+            active_panels = {},
+            recent_events = self.RecentEvents,
+        }
 
-    local panelList = {}
-    for _, p in pairs(self.ActivePanels) do
-        panelList[#panelList + 1] = p
-    end
-    table.sort(panelList, function(a, b) return tostring(a.uid) < tostring(b.uid) end)
-    reportData.active_panels = panelList
-    reportData.summary.total_active_panels = #panelList
+        local panelList = {}
+        for _, p in pairs(self.ActivePanels) do
+            panelList[#panelList + 1] = p
+        end
+        table.sort(panelList, function(a, b) return tostring(a.uid) < tostring(b.uid) end)
+        reportData.active_panels = panelList
+        reportData.summary.total_active_panels = #panelList
 
-    -- Serialize JSON
-    local jsonString = to_json_indented(reportData)
-    local jsonSaved = saveOutputFile(jsonPath, jsonString)
+        -- Serialize JSON
+        local jsonString = to_json_indented(reportData)
 
-    -- Serialize TXT summary
-    local txtString = generateTxtSummary(reportData)
-    local txtSaved = saveOutputFile(txtPath, txtString)
+        -- Serialize TXT summary
+        local txtString = generateTxtSummary(reportData)
 
-    if jsonSaved then
-        report("Successfully saved diagnostics to: " .. jsonPath .. " (Panels: " .. #panelList .. ", Widgets: " .. self.CapturedWidgetsCount .. ")")
-    else
-        report("Warning: failed to save JSON to: " .. jsonPath .. ", attempting temp fallback")
+        -- 1. Save to Saved/Logs
+        local jsonSaved = saveOutputFile(jsonPath, jsonString)
+        local txtSaved = saveOutputFile(txtPath, txtString)
+
+        -- 2. Always save to %TEMP%
         local tempDir = os.getenv("TEMP")
         if tempDir then
             saveOutputFile(tempDir .. "/lotm_diagnostics.json", jsonString)
             saveOutputFile(tempDir .. "/lotm_diagnostics.txt", txtString)
         end
+
+        report(string.format("Diagnostics dumped #%d: SavedLogs=%s, Temp=true, Panels=%d, Widgets=%d",
+            self.DumpCount, tostring(jsonSaved), #panelList, self.CapturedWidgetsCount))
+    end)
+
+    if not ok then
+        reportError("Diagnostics:Flush", err)
+    end
+end
+
+-- Public method called by external hooks (e.g. Init.lua)
+function Diagnostics:InspectPanel(component, reason)
+    local ok, err = pcall(function()
+        inspectPanel(component, reason)
+        self:Flush()
+    end)
+    if not ok then
+        reportError("Diagnostics:InspectPanel", err)
     end
 end
 
@@ -723,13 +825,17 @@ local function requestDebouncedFlush(delaySeconds)
     delaySeconds = delaySeconds or 0.25
 
     local scheduled = false
-    local GameObj = rawget(_G, "Game")
-    if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
-        scheduled = pcall(GameObj.NewUIManager.AddTimerWithFunction, GameObj.NewUIManager, delaySeconds, 1, function()
-            flushPending = false
-            Diagnostics:Flush()
-        end)
-    end
+    pcall(function()
+        local GameObj = rawget(_G, "Game")
+        if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
+            GameObj.NewUIManager:AddTimerWithFunction(delaySeconds, 1, function()
+                flushPending = false
+                Diagnostics:Flush()
+            end)
+            scheduled = true
+        end
+    end)
+
     if not scheduled then
         flushPending = false
         Diagnostics:Flush()
@@ -740,8 +846,9 @@ local function installUIComponentHooks(targetClass)
     if type(targetClass) ~= "table" then return false end
     if rawget(targetClass, "__lotmDiagnosticsHooked") then return true end
 
+    local hookedCount = 0
     for _, methodName in ipairs({ "Open", "Refresh" }) do
-        local original = rawget(targetClass, methodName)
+        local original = targetClass[methodName]
         if type(original) == "function" then
             targetClass[methodName] = function(self, ...)
                 local results = { original(self, ...) }
@@ -751,12 +858,45 @@ local function installUIComponentHooks(targetClass)
                 end)
                 return unpack(results)
             end
+            hookedCount = hookedCount + 1
         end
     end
 
     rawset(targetClass, "__lotmDiagnosticsHooked", true)
-    report("Successfully hooked UIComponent.Open and UIComponent.Refresh")
-    return true
+    report("Hooked UIComponent methods: " .. tostring(hookedCount) .. " (Open/Refresh)")
+    return hookedCount > 0
+end
+
+local function resolveUIComponentClass(value, environment)
+    if type(value) == "table" then
+        if type(value.Open) == "function" or type(value.Refresh) == "function" then
+            return value
+        end
+        if type(value.UIComponent) == "table" then
+            return value.UIComponent
+        end
+    end
+    if type(environment) == "table" then
+        if type(environment.UIComponent) == "table" then
+            return environment.UIComponent
+        end
+    end
+    local g = rawget(_G, "UIComponent")
+    if type(g) == "table" then
+        return g
+    end
+    if type(package) == "table" and type(package.loaded) == "table" then
+        local pkg = package.loaded["Framework.KGFramework.KGUI.Core.UIComponent"]
+        if type(pkg) == "table" then
+            if type(pkg.Open) == "function" or type(pkg.Refresh) == "function" then
+                return pkg
+            end
+            if type(pkg.UIComponent) == "table" then
+                return pkg.UIComponent
+            end
+        end
+    end
+    return nil
 end
 
 -- ----------------------------------------------------------------------------
@@ -768,16 +908,18 @@ local function schedulePeriodicScan()
     timerRunning = true
 
     local function onTick()
-        -- Inspect any active panels present in NewUIManager or already tracked
         pcall(function()
             local GameObj = rawget(_G, "Game")
             if GameObj ~= nil and GameObj.NewUIManager ~= nil then
-                -- Check open components table if accessible
-                local openComps = GameObj.NewUIManager.openComponents or GameObj.NewUIManager.Components
-                if type(openComps) == "table" then
-                    for _, comp in pairs(openComps) do
-                        if type(comp) == "table" and not comp.isDestroyed then
-                            inspectPanel(comp, "TimerTick")
+                local mgr = GameObj.NewUIManager
+                for _, prop in ipairs({ "openComponents", "Components", "allComponents", "PanelMap" }) do
+                    local tbl = nil
+                    pcall(function() tbl = mgr[prop] end)
+                    if type(tbl) == "table" then
+                        for _, comp in pairs(tbl) do
+                            if type(comp) == "table" and not comp.isDestroyed then
+                                inspectPanel(comp, "TimerTick")
+                            end
                         end
                     end
                 end
@@ -787,18 +929,21 @@ local function schedulePeriodicScan()
             end
         end)
 
-        -- Re-schedule next tick
-        local GameObj = rawget(_G, "Game")
-        if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
-            pcall(GameObj.NewUIManager.AddTimerWithFunction, GameObj.NewUIManager, 2.0, 1, onTick)
-        end
+        pcall(function()
+            local GameObj = rawget(_G, "Game")
+            if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
+                GameObj.NewUIManager:AddTimerWithFunction(2.0, 1, onTick)
+            end
+        end)
     end
 
-    local GameObj = rawget(_G, "Game")
-    if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
-        pcall(GameObj.NewUIManager.AddTimerWithFunction, GameObj.NewUIManager, 2.0, 1, onTick)
-        report("Periodic 2-second UI diagnostics timer started")
-    end
+    pcall(function()
+        local GameObj = rawget(_G, "Game")
+        if GameObj ~= nil and GameObj.NewUIManager ~= nil and type(GameObj.NewUIManager.AddTimerWithFunction) == "function" then
+            GameObj.NewUIManager:AddTimerWithFunction(2.0, 1, onTick)
+            report("Periodic 2-second UI diagnostics timer started")
+        end
+    end)
 end
 
 -- ----------------------------------------------------------------------------
@@ -807,20 +952,18 @@ end
 local function initialize()
     report("Initializing LotmDiagnostics v" .. VERSION .. "...")
 
-    -- Hook UIComponent immediately if loaded
-    local loadedUIComp = package.loaded["Framework.KGFramework.KGUI.Core.UIComponent"]
-        or rawget(_G, "UIComponent")
-    if loadedUIComp ~= nil then
-        installUIComponentHooks(loadedUIComp)
+    local compClass = resolveUIComponentClass()
+    if compClass ~= nil then
+        installUIComponentHooks(compClass)
     end
 
-    -- Hook via LOMModLoader if available
     local Loader = rawget(_G, "LOMModLoader")
     if Loader ~= nil and type(Loader.AfterLoad) == "function" then
         Loader.AfterLoad(
             "Framework.KGFramework.KGUI.Core.UIComponent",
             function(value, environment)
-                installUIComponentHooks(value)
+                local cls = resolveUIComponentClass(value, environment) or value
+                installUIComponentHooks(cls)
                 return value
             end,
             2000000,
@@ -831,17 +974,29 @@ local function initialize()
             Loader.On("after_main", function()
                 report("after_main triggered: scanning environment and starting timers...")
                 pcall(schedulePeriodicScan)
-                pcall(function() Diagnostics:Flush() end)
+                local okFlush, errFlush = pcall(function() Diagnostics:Flush() end)
+                if not okFlush then
+                    reportError("after_main Diagnostics:Flush", errFlush)
+                end
             end, 2000000, "lotm.diagnostics.after_main")
         end
     end
 
-    -- Initial flush to record starting environment
-    Diagnostics:Flush()
-    report("LotmDiagnostics v" .. VERSION .. " initialized successfully")
+    -- Initial test flush to verify file writing at launch
+    local ok, err = pcall(function()
+        Diagnostics:Flush()
+    end)
+    if not ok then
+        reportError("initial Diagnostics:Flush", err)
+    else
+        report("LotmDiagnostics v" .. VERSION .. " initialized successfully")
+    end
 end
 
-pcall(initialize)
+local okInit, errInit = pcall(initialize)
+if not okInit then
+    reportError("initialize", errInit)
+end
 
 _G.LotmDiagnostics = Diagnostics
 return Diagnostics
