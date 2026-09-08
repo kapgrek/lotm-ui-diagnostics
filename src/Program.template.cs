@@ -41,7 +41,7 @@ namespace LotmDiagnosticsTool
 
         private void InitializeComponent()
         {
-            this.Text = "Lord of the Mysteries — Диагностика UI и Шрифтов v1.0.3";
+            this.Text = "Lord of the Mysteries — Диагностика UI и Шрифтов v1.0.4";
             this.Size = new Size(720, 620);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;

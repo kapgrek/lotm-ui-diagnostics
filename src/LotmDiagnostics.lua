@@ -5,7 +5,7 @@
 --          to pinpoint font stretching, LetterSpacing, and asset resolution.
 -- ============================================================================
 
-local VERSION = "1.0.3"
+local VERSION = "1.0.4"
 local MODULE_TAG = "[LotmDiagnostics]"
 
 -- ----------------------------------------------------------------------------
@@ -546,20 +546,39 @@ local function isTextWidget(w)
     local twType = type(w)
     if twType ~= "userdata" and twType ~= "table" then return false end
 
-    -- 1. Containers (UserWidgets with WidgetTree) are NOT leaf text widgets
-    local isContainer = false
-    pcall(function()
-        if w.WidgetTree ~= nil then isContainer = true end
-    end)
-    if isContainer then return false end
-
-    -- 2. UPanelWidget containers with children are NOT leaf text widgets
+    -- 1. UPanelWidget containers with children are NOT leaf text widgets
+    local hasChildren = false
     pcall(function()
         if type(w.GetChildrenCount) == "function" and tonumber(w:GetChildrenCount()) > 0 then
-            isContainer = true
+            hasChildren = true
         end
     end)
-    if isContainer then return false end
+    if hasChildren then return false end
+
+    -- 2. Inspect class name
+    local cname = ""
+    pcall(function()
+        if type(w.GetClass) == "function" then
+            local c = w:GetClass()
+            if c ~= nil and type(c.GetName) == "function" then
+                cname = tostring(c:GetName())
+            end
+        end
+    end)
+    if cname == "" and twType == "table" and w.__cname then
+        cname = tostring(w.__cname)
+    end
+
+    -- Known text widget classes
+    if cname ~= "" then
+        if cname:find("TextBlock") or cname:find("RichText") or cname:find("TextWidget") then
+            return true
+        end
+        -- Composite user widgets (WBP_...) or UI panels are containers, not leaf text widgets
+        if cname:find("^WBP_") or cname:find("_Panel") or cname:find("Component") then
+            return false
+        end
+    end
 
     -- 3. Check for text methods (GetText / GetPlainText)
     local hasTextMethod = false
@@ -570,22 +589,7 @@ local function isTextWidget(w)
     end)
     if hasTextMethod then return true end
 
-    -- 4. Check class name for known text widget classes
-    local isTextClass = false
-    pcall(function()
-        if type(w.GetClass) == "function" then
-            local c = w:GetClass()
-            if c ~= nil and type(c.GetName) == "function" then
-                local cname = tostring(c:GetName())
-                if cname:find("TextBlock") or cname:find("RichText") or cname:find("KGTextBlock") then
-                    isTextClass = true
-                end
-            end
-        end
-    end)
-    if isTextClass then return true end
-
-    -- 5. Has Font / DefaultTextStyleOverride AND valid string text
+    -- 4. Has Font / DefaultTextStyleOverride AND valid string text
     local hasFont = false
     pcall(function()
         if type(w.GetFont) == "function" or w.Font ~= nil or w.DefaultTextStyleOverride ~= nil then
@@ -597,6 +601,15 @@ local function isTextWidget(w)
         if rawT ~= "" then return true end
     end
 
+    -- 5. Text property with non-empty string
+    local hasStringText = false
+    pcall(function()
+        if type(w.Text) == "string" and w.Text ~= "" then
+            hasStringText = true
+        end
+    end)
+    if hasStringText then return true end
+
     return false
 end
 
@@ -606,7 +619,7 @@ local function walkAllWidgets(owner, visited, collector)
 
     -- If owner is a Lua table (e.g. component or view table)
     if type(owner) == "table" then
-        local rw = owner.userWidget or owner.widget or owner.panel or owner.RootWidget or owner.m_Widget
+        local rw = owner.userWidget or owner.widget or owner.panel or owner.RootWidget or owner.m_Widget or owner.m_UserWidget
         if rw ~= nil then
             walkAllWidgets(rw, visited, collector)
         end
@@ -636,19 +649,55 @@ local function walkAllWidgets(owner, visited, collector)
                 walkAllWidgets(child, visited, collector)
             end
         end
+        -- Also scan direct fields of the component table that hold text or composite widgets
+        for k, v in pairs(owner) do
+            if type(k) == "string" and type(v) ~= "function" then
+                if k:find("^Text") or k:find("^Rich") or k:find("^TB_") or k:find("^RTB_") or k:find("^WBP_") then
+                    walkAllWidgets(v, visited, collector)
+                end
+            end
+        end
         return
     end
 
-    -- owner is a userdata / UObject
+    -- owner is a userdata / UObject: inspect it!
     pcall(collector, owner)
 
-    -- If owner is a UUserWidget, traverse its WidgetTree.RootWidget!
+    -- If owner has WidgetTree, traverse RootWidget & GetAllWidgets
     local tree = nil
     pcall(function() tree = owner.WidgetTree end)
     if tree ~= nil then
         pcall(function()
             if tree.RootWidget ~= nil then
                 walkAllWidgets(tree.RootWidget, visited, collector)
+            end
+        end)
+        pcall(function()
+            if type(tree.GetAllWidgets) == "function" then
+                local tbl = {}
+                local ok = pcall(tree.GetAllWidgets, tree, tbl)
+                if ok and #tbl > 0 then
+                    for _, w in ipairs(tbl) do
+                        walkAllWidgets(w, visited, collector)
+                    end
+                elseif slua and type(slua.Array) == "function" then
+                    local propCls = import and import("EPropertyClass")
+                    local widgetCls = import and import("Widget")
+                    if propCls and widgetCls then
+                        local arr = slua.Array(propCls.Object, widgetCls)
+                        if arr then
+                            local ok2 = pcall(tree.GetAllWidgets, tree, arr)
+                            if ok2 and arr.Num and arr.Get then
+                                for idx = 0, arr:Num() - 1 do
+                                    local item = arr:Get(idx)
+                                    if item ~= nil then
+                                        walkAllWidgets(item, visited, collector)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end)
     end
@@ -715,12 +764,13 @@ local function inspectPanel(component, triggerReason)
     pcall(function() view = component.view end)
 
     local panelWidgets = {}
+    local collected = setmetatable({}, { __mode = "k" })
     local visited = setmetatable({}, { __mode = "k" })
 
     local function checkAndCollect(w)
-        if w == nil or visited[w] then return end
+        if w == nil or collected[w] then return end
         if isTextWidget(w) then
-            visited[w] = true
+            collected[w] = true
             local details = nil
             pcall(function() details = inspectWidgetDetails(w) end)
             if details ~= nil then
@@ -774,6 +824,7 @@ local function inspectPanel(component, triggerReason)
             end
         end
         if found ~= nil then
+            checkAndCollect(found)
             walkAllWidgets(found, visited, checkAndCollect)
         end
     end
