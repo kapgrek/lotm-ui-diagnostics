@@ -5,7 +5,7 @@
 --          to pinpoint font stretching, LetterSpacing, and asset resolution.
 -- ============================================================================
 
-local VERSION = "1.0.1"
+local VERSION = "1.0.2"
 local MODULE_TAG = "[LotmDiagnostics]"
 
 -- ----------------------------------------------------------------------------
@@ -96,20 +96,38 @@ end
 -- ----------------------------------------------------------------------------
 -- 2. Pure-Lua Zero-Dependency JSON Serializer (Crash-Proof)
 -- ----------------------------------------------------------------------------
+local json_escape_map = {}
+for i = 0, 255 do
+    if i == 34 then -- "
+        json_escape_map[i] = "\\\""
+    elseif i == 92 then -- \
+        json_escape_map[i] = "\\\\"
+    elseif i == 8 then -- \b
+        json_escape_map[i] = "\\b"
+    elseif i == 9 then -- \t
+        json_escape_map[i] = "\\t"
+    elseif i == 10 then -- \n
+        json_escape_map[i] = "\\n"
+    elseif i == 12 then -- \f
+        json_escape_map[i] = "\\f"
+    elseif i == 13 then -- \r
+        json_escape_map[i] = "\\r"
+    elseif i < 32 then
+        json_escape_map[i] = string.format("\\u%04x", i)
+    else
+        json_escape_map[i] = string.char(i)
+    end
+end
+
 local function escape_json_string(s)
     if type(s) ~= "string" then s = tostring(s or "") end
-    local escapes = {
-        ["\\"] = "\\\\",
-        ["\""] = "\\\"",
-        ["\b"] = "\\b",
-        ["\f"] = "\\f",
-        ["\n"] = "\\n",
-        ["\r"] = "\\r",
-        ["\t"] = "\\t",
-    }
-    return s:gsub("[\"\\\b\f\n\r\t]", escapes):gsub("[\0-\31]", function(c)
-        return string.format("\\u%04x", string.byte(c))
-    end)
+    local len = #s
+    local res = {}
+    for i = 1, len do
+        local b = string.byte(s, i)
+        res[i] = json_escape_map[b]
+    end
+    return table.concat(res)
 end
 
 local function is_table_array(t)
@@ -478,7 +496,14 @@ local function inspectWidgetDetails(widget)
         end
     end)
 
-    local hasCyrillic = rawText:find("[\208\209]") ~= nil
+    local hasCyrillic = false
+    for i = 1, #rawText do
+        local b = string.byte(rawText, i)
+        if b == 208 or b == 209 then
+            hasCyrillic = true
+            break
+        end
+    end
 
     local widgetClass = (type(widget) == "table" and widget.__cname) or "Widget"
     pcall(function()
