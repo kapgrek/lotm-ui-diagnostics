@@ -41,7 +41,7 @@ namespace LotmDiagnosticsTool
 
         private void InitializeComponent()
         {
-            this.Text = "Lord of the Mysteries — Диагностика UI и Шрифтов v1.0.2";
+            this.Text = "Lord of the Mysteries — Диагностика UI и Шрифтов v1.0.3";
             this.Size = new Size(720, 620);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -418,6 +418,13 @@ namespace LotmDiagnosticsTool
                 if (!Directory.Exists(luaDir)) Directory.CreateDirectory(luaDir);
 
                 // 1. Install LotmDiagnostics.lua in both mods/cpdd_runtime_fixes and Mods root
+                try {
+                    string oldErr = Path.Combine(Path.GetTempPath(), "lotm_diagnostics_error.log");
+                    if (File.Exists(oldErr)) File.Delete(oldErr);
+                    string oldErrSaved = Path.Combine(gamePath, "Saved", "Logs", "lotm_diagnostics_error.log");
+                    if (File.Exists(oldErrSaved)) File.Delete(oldErrSaved);
+                } catch { }
+
                 string modTarget = Path.Combine(luaDir, "LotmDiagnostics.lua");
                 byte[] modBytes = Convert.FromBase64String(EmbeddedModLuaBase64);
                 File.WriteAllBytes(modTarget, modBytes);

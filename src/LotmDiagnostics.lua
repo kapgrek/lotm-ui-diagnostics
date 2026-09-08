@@ -5,7 +5,7 @@
 --          to pinpoint font stretching, LetterSpacing, and asset resolution.
 -- ============================================================================
 
-local VERSION = "1.0.2"
+local VERSION = "1.0.3"
 local MODULE_TAG = "[LotmDiagnostics]"
 
 -- ----------------------------------------------------------------------------
@@ -322,11 +322,6 @@ local function getWidgetText(widget)
             if ok and t ~= nil then text = tostring(t) end
         end
         if text == "" then
-            local t = nil
-            pcall(function() t = widget.Text end)
-            if t ~= nil then text = tostring(t) end
-        end
-        if text == "" then
             local getPT = nil
             pcall(function() getPT = widget.GetPlainText end)
             if type(getPT) == "function" then
@@ -334,11 +329,25 @@ local function getWidgetText(widget)
                 if ok and t ~= nil then text = tostring(t) end
             end
         end
-        if text == "" then
+        if text == "" and widget.Text ~= nil then
+            local val = nil
+            pcall(function() val = widget.Text end)
+            if val ~= nil then
+                if type(val) == "string" then
+                    text = val
+                elseif type(val) == "userdata" then
+                    local s = tostring(val)
+                    if not s:find(":") and not s:find("0x") and not s:find("userdata:") and not s:find("TextBlock") then
+                        text = s
+                    end
+                end
+            end
+        end
+        if text == "" and widget.Content ~= nil then
             local cnt = nil
             pcall(function() cnt = widget.Content end)
-            if cnt ~= nil and type(cnt) ~= "table" and type(cnt) ~= "userdata" then
-                text = tostring(cnt)
+            if cnt ~= nil and type(cnt) == "string" then
+                text = cnt
             end
         end
     end)
@@ -530,15 +539,121 @@ local function inspectWidgetDetails(widget)
 end
 
 -- ----------------------------------------------------------------------------
--- 6. Widget Tree Traversal
+-- 6. Widget Tree Traversal & Inspection
 -- ----------------------------------------------------------------------------
+local function isTextWidget(w)
+    if w == nil then return false end
+    local twType = type(w)
+    if twType ~= "userdata" and twType ~= "table" then return false end
+
+    -- 1. Containers (UserWidgets with WidgetTree) are NOT leaf text widgets
+    local isContainer = false
+    pcall(function()
+        if w.WidgetTree ~= nil then isContainer = true end
+    end)
+    if isContainer then return false end
+
+    -- 2. UPanelWidget containers with children are NOT leaf text widgets
+    pcall(function()
+        if type(w.GetChildrenCount) == "function" and tonumber(w:GetChildrenCount()) > 0 then
+            isContainer = true
+        end
+    end)
+    if isContainer then return false end
+
+    -- 3. Check for text methods (GetText / GetPlainText)
+    local hasTextMethod = false
+    pcall(function()
+        if type(w.GetText) == "function" or type(w.GetPlainText) == "function" then
+            hasTextMethod = true
+        end
+    end)
+    if hasTextMethod then return true end
+
+    -- 4. Check class name for known text widget classes
+    local isTextClass = false
+    pcall(function()
+        if type(w.GetClass) == "function" then
+            local c = w:GetClass()
+            if c ~= nil and type(c.GetName) == "function" then
+                local cname = tostring(c:GetName())
+                if cname:find("TextBlock") or cname:find("RichText") or cname:find("KGTextBlock") then
+                    isTextClass = true
+                end
+            end
+        end
+    end)
+    if isTextClass then return true end
+
+    -- 5. Has Font / DefaultTextStyleOverride AND valid string text
+    local hasFont = false
+    pcall(function()
+        if type(w.GetFont) == "function" or w.Font ~= nil or w.DefaultTextStyleOverride ~= nil then
+            hasFont = true
+        end
+    end)
+    if hasFont then
+        local rawT = getWidgetText(w)
+        if rawT ~= "" then return true end
+    end
+
+    return false
+end
+
 local function walkAllWidgets(owner, visited, collector)
     if owner == nil or visited[owner] then return end
     visited[owner] = true
 
+    -- If owner is a Lua table (e.g. component or view table)
+    if type(owner) == "table" then
+        local rw = owner.userWidget or owner.widget or owner.panel or owner.RootWidget or owner.m_Widget
+        if rw ~= nil then
+            walkAllWidgets(rw, visited, collector)
+        end
+        if type(owner.view) == "table" then
+            for _, v in pairs(owner.view) do
+                if v ~= nil and type(v) ~= "function" then
+                    walkAllWidgets(v, visited, collector)
+                end
+            end
+            if type(owner.view._widgetCache) == "table" then
+                for _, v in pairs(owner.view._widgetCache) do
+                    if v ~= nil and type(v) ~= "function" then
+                        walkAllWidgets(v, visited, collector)
+                    end
+                end
+            end
+        end
+        if type(owner._widgetCache) == "table" then
+            for _, v in pairs(owner._widgetCache) do
+                if v ~= nil and type(v) ~= "function" then
+                    walkAllWidgets(v, visited, collector)
+                end
+            end
+        end
+        if type(owner._childComponents) == "table" then
+            for _, child in pairs(owner._childComponents) do
+                walkAllWidgets(child, visited, collector)
+            end
+        end
+        return
+    end
+
+    -- owner is a userdata / UObject
     pcall(collector, owner)
 
-    -- Children via UPanelWidget
+    -- If owner is a UUserWidget, traverse its WidgetTree.RootWidget!
+    local tree = nil
+    pcall(function() tree = owner.WidgetTree end)
+    if tree ~= nil then
+        pcall(function()
+            if tree.RootWidget ~= nil then
+                walkAllWidgets(tree.RootWidget, visited, collector)
+            end
+        end)
+    end
+
+    -- Children via UPanelWidget (CanvasPanel, HorizontalBox, VerticalBox, Overlay, ScrollBox, etc.)
     local count = nil
     pcall(function()
         if type(owner.GetChildrenCount) == "function" then
@@ -555,7 +670,7 @@ local function walkAllWidgets(owner, visited, collector)
         end
     end
 
-    -- Direct content container
+    -- Direct content container (UBorder, USizeBox, UButton, etc.)
     local content = nil
     pcall(function()
         if type(owner.GetContent) == "function" then
@@ -566,7 +681,7 @@ local function walkAllWidgets(owner, visited, collector)
         walkAllWidgets(content, visited, collector)
     end
 
-    -- ListView / TileView virtualized row entries
+    -- Virtualized ListView / TileView / TreeView entries
     local getDisplayedEntries = nil
     pcall(function() getDisplayedEntries = owner.GetDisplayedEntryWidgets end)
     if type(getDisplayedEntries) == "function" then
@@ -579,17 +694,6 @@ local function walkAllWidgets(owner, visited, collector)
             end
         end
     end
-
-    -- Child widgets via view table
-    pcall(function()
-        if type(owner.view) == "table" then
-            for _, vw in pairs(owner.view) do
-                if vw ~= nil and type(vw) ~= "function" then
-                    walkAllWidgets(vw, visited, collector)
-                end
-            end
-        end
-    end)
 end
 
 -- ----------------------------------------------------------------------------
@@ -605,7 +709,7 @@ local function inspectPanel(component, triggerReason)
 
     local rootWidget = nil
     pcall(function()
-        rootWidget = component.userWidget or component.widget or (type(component) ~= "table" and component)
+        rootWidget = component.userWidget or component.widget or component.panel or (type(component) ~= "table" and component)
     end)
     local view = nil
     pcall(function() view = component.view end)
@@ -614,32 +718,9 @@ local function inspectPanel(component, triggerReason)
     local visited = setmetatable({}, { __mode = "k" })
 
     local function checkAndCollect(w)
-        if w == nil then return end
-        local isText = false
-        pcall(function()
-            local getText = nil
-            pcall(function() getText = w.GetText end)
-            if type(getText) == "function" then isText = true end
-        end)
-        if not isText then
-            pcall(function()
-                if w.Text ~= nil then isText = true end
-            end)
-        end
-        if not isText then
-            pcall(function()
-                local getFont = nil
-                pcall(function() getFont = w.GetFont end)
-                if type(getFont) == "function" or w.Font ~= nil then isText = true end
-            end)
-        end
-        if not isText then
-            pcall(function()
-                if w.DefaultTextStyleOverride ~= nil then isText = true end
-            end)
-        end
-
-        if isText then
+        if w == nil or visited[w] then return end
+        if isTextWidget(w) then
+            visited[w] = true
             local details = nil
             pcall(function() details = inspectWidgetDetails(w) end)
             if details ~= nil then
@@ -648,29 +729,54 @@ local function inspectPanel(component, triggerReason)
         end
     end
 
+    -- 1. Walk component itself (handles table references, view, _childComponents)
+    walkAllWidgets(component, visited, checkAndCollect)
+
+    -- 2. Walk root widget explicitly
     if rootWidget ~= nil then
         walkAllWidgets(rootWidget, visited, checkAndCollect)
     end
 
-    if type(view) == "table" then
-        for _, vw in pairs(view) do
-            if vw ~= nil and type(vw) ~= "function" then
-                walkAllWidgets(vw, visited, checkAndCollect)
+    -- 3. Probe common text widget names directly via UIFunctionLibrary / WidgetTree / View
+    local probeNames = {
+        "Text_TargetDesc", "Text_Name", "Text_ChapterName", "Text_Title", "Text_Content",
+        "Text_Tips", "Text_BtnName", "Text_Use", "Text_Used", "TextUsing", "Text_State",
+        "Text_Status", "Text_Apply", "Text_Equip", "RichText_Use", "Button_Text",
+        "RichText_Hint01", "RichText_Hint02", "RichText_Path", "Text_Price", "Text_Cost",
+        "Text_Num", "Text_Count", "Text_Level", "Text_Gold", "Text_ItemName", "Text_TaskName",
+        "Text_Recommend", "Text_Extra", "Text_Reset", "TB_Word", "Text_lua", "Text2_lua",
+        "Text_Desc", "Text_Detail", "Text_Quality", "Text_Attr", "Text_Coin", "Text_Diamond",
+        "Text_GoldCoin", "Text_SilverCoin", "Text_CopperCoin", "Text_PlayerName", "Text_RoleName"
+    }
+
+    local uiLib = safe_import("UIFunctionLibrary")
+    local findWidgetFn = uiLib and uiLib.FindWidget
+
+    for _, name in ipairs(probeNames) do
+        local found = nil
+        if view ~= nil and view[name] ~= nil then
+            found = view[name]
+        end
+        if found == nil and rootWidget ~= nil then
+            pcall(function()
+                if rootWidget.WidgetTree ~= nil then
+                    if rootWidget.WidgetTree.FindWidget ~= nil then
+                        found = rootWidget.WidgetTree:FindWidget(name)
+                    elseif rootWidget.WidgetTree.GetWidgetFromName ~= nil then
+                        found = rootWidget.WidgetTree:GetWidgetFromName(name)
+                    end
+                end
+            end)
+            if found == nil and type(findWidgetFn) == "function" then
+                pcall(function()
+                    found = findWidgetFn(rootWidget, name)
+                end)
             end
+        end
+        if found ~= nil then
+            walkAllWidgets(found, visited, checkAndCollect)
         end
     end
-
-    -- Walk child components
-    pcall(function()
-        if type(component._childComponents) == "table" then
-            for _, child in pairs(component._childComponents) do
-                local childRoot = child and (child.userWidget or child.widget)
-                if childRoot ~= nil then
-                    walkAllWidgets(childRoot, visited, checkAndCollect)
-                end
-            end
-        end
-    end)
 
     local className = uid
     pcall(function() className = tostring(component.__cname or uid) end)
@@ -975,6 +1081,11 @@ end
 -- 11. Module Initialization
 -- ----------------------------------------------------------------------------
 local function initialize()
+    pcall(function()
+        local tempDir = os.getenv("TEMP") or "."
+        local f = io.open(tempDir .. "/lotm_diagnostics_error.log", "w")
+        if f then f:close() end
+    end)
     report("Initializing LotmDiagnostics v" .. VERSION .. "...")
 
     local compClass = resolveUIComponentClass()
